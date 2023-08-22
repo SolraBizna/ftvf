@@ -64,7 +64,7 @@ self.render_at(self.previous_position
 `ftvf` is distributed under the zlib license. The complete text is as
 follows:
 
-> Copyright (c) 2019, Solra Bizna
+> Copyright (c) 2019, 2023 Solra Bizna
 > 
 > This software is provided "as-is", without any express or implied
 > warranty. In no event will the author be held liable for any damages
