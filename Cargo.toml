@@ -11,3 +11,7 @@ keywords = ["gamedev", "time"]
 maintenance = "passively-maintained"
 
 [dependencies]
+
+[features]
+default = []
+no_std = []

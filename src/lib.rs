@@ -18,15 +18,18 @@
 //!
 //! ```rust
 //! # use ftvf::*;
+//! # #[cfg(not(feature="no_std"))] {
 //! let mut metronome = Metronome::new(RealtimeNowSource::new(),
 //!                                    (30, 1), // want 30 ticks per 1 second
 //!                                    5); // accept being up to 5 ticks behind
+//! # }
 //! ```
 //!
 //! And then your game loop looks like this:
 //!
 //! ```rust
 //! # use ftvf::*;
+//! # #[cfg(not(feature="no_std"))] {
 //! # struct GameWorld {}
 //! # impl GameWorld {
 //! #   fn handle_input(&mut self) {}
@@ -57,6 +60,7 @@
 //!     }
 //!   }
 //! }
+//! # }
 //! ```
 //!
 //! Your logic ticks operate in discrete, fixed time intervals. Then, when it
@@ -99,35 +103,57 @@
 //! > be misrepresented as being the original software.
 //! > 3. This notice may not be removed or altered from any source
 //! > distribution.
-use std::time::{Duration,Instant};
+
+#![cfg_attr(feature="no_std",no_std)]
+
+// Do link to `std` if we're testing. This has to be top level instead of in
+// the test module because `#[macro_use]`, applied to an `extern crate`, is
+// only allowed at the top level.
+#[cfg(feature="no_std")] #[macro_use]
+extern crate std;
+
+use core::time::Duration;
+
+#[cfg(not(feature="no_std"))]
+mod realtime;
+#[cfg(not(feature="no_std"))]
+pub use realtime::RealtimeNowSource;
 
 /// A source of time information for [`Metronome`](struct.Metronome.html) to
 /// use. For most purposes,
 /// [`RealtimeNowSource`](struct.RealtimeNowSource.html) will be sufficient.
 pub trait NowSource : Copy {
-    /// Return an `Instant` representing *now*.
-    fn now(&mut self) -> Instant;
+    type Instant: TemporalSample + Clone;
+    /// Return a point in time representing Now.
+    fn now(&mut self) -> Self::Instant;
     /// Sleep until at least `how_long` from *now*. Optional.
     ///
-    /// Will only be called very soon after `now()`, so no need to specially
-    /// account for "temporal slippage".
+    /// Will only be called very soon after `now()`. Any attempt to account for
+    /// temporal slippage would do more harm than good.
     #[allow(unused)]
     fn sleep(&mut self, how_long: Duration) {}
 }
 
-/// A [`NowSource`](trait.NowSource.html) that uses the standard Rust timing
-/// facilities to obtain its timing information. This is the default
-/// `NowSource`, and also the one you almost certainly want to use.
-#[derive(Debug,Copy,Clone)]
-pub struct RealtimeNowSource {}
-
-impl RealtimeNowSource {
-    pub fn new() -> RealtimeNowSource { RealtimeNowSource { } }
-}
-
-impl NowSource for RealtimeNowSource {
-    fn now(&mut self) -> Instant { Instant::now() }
-    fn sleep(&mut self, how_long: Duration) { std::thread::sleep(how_long) }
+/// A type that represents a particular point in time. You only need to worry
+/// about it if you're implementing your own timing routines.
+pub trait TemporalSample : Sized {
+    /// If this TemporalSample is *after* the given origin, return the
+    /// `Duration` that has passed since that point. If this TemporalSample is
+    /// *before* the given origin, return `None`.
+    fn time_since(&self, origin: &Self) -> Option<Duration>;
+    /// Return a new TemporalSample that is this far in the future.
+    ///
+    /// If you cannot advance precisely (because your timebase is less precise
+    /// than `Duration`), you must always undershoot, never overshoot. In
+    /// addition, *you* must keep track of the residual, and apply it to the
+    /// next call(s) to `advance`, so that, *over time*, the missing time
+    /// eventually gets caught up with.
+    fn advanced_by(&self, amount: Duration) -> Self;
+    /// As `advanced_by`, but mutates self instead of returning a new value.
+    /// The default just does `*self = self.advanced_by(amount)`.
+    fn advance_by(&mut self, amount: Duration) {
+        *self = self.advanced_by(amount);
+    }
 }
 
 /// The meat of the crate. Contains all state necessary to turn pure temporal
@@ -135,10 +161,10 @@ impl NowSource for RealtimeNowSource {
 ///
 /// See the crate-level documentation for more information.
 #[derive(Debug,Copy,Clone)]
-pub struct Metronome<N: NowSource = RealtimeNowSource> {
+pub struct Metronome<N: NowSource> {
     now_source: N,
-    epoch: Instant,
-    now: Instant,
+    epoch: N::Instant,
+    now: N::Instant,
     ticks_per_second: (u32, u32),
     max_ticks_behind: u32,
     last_tick_no: u64,
@@ -229,20 +255,27 @@ impl<N: NowSource> Metronome<N> {
     /// and the only problem you would have from `(1, u32::MAX)` would be
     /// dying of old age waiting for your first `Tick`.
     /// - `max_ticks_behind`: The maximum number of ticks we can "fall behind"
-    /// before we start dropping ticks. For a non-multiplayer application this
-    /// should be fairly low, e.g. in the 1-3 range. In multiplayer, we should
-    /// try harder to keep up, and a value on the order of several seconds'
-    /// worth of ticks would be preferred.
-    pub fn new(mut now_source: N,
-               ticks_per_second: (u32, u32),
-               max_ticks_behind: u32) -> Metronome<N> {
+    /// before we start dropping ticks. Increasing this value makes your game's
+    /// tick pacing more steady over time, at the cost of making the play
+    /// experience more miserable on computers too slow to play the game in
+    /// realtime.  
+    /// For a non-multiplayer application this should be fairly low, e.g. in
+    /// the 1-3 range. In multiplayer, we should try harder to keep up, and a
+    /// value on the order of several seconds' worth of ticks might be
+    /// preferred.
+    pub fn new(
+        mut now_source: N,
+        ticks_per_second: (u32, u32),
+        max_ticks_behind: u32,
+    ) -> Metronome<N> {
         assert_ne!(ticks_per_second.0, 0);
         assert_ne!(ticks_per_second.1, 0);
         let epoch = now_source.now();
+        let now = epoch.clone();
         Metronome {
             now_source,
             epoch,
-            now: epoch,
+            now,
             ticks_per_second,
             max_ticks_behind,
             last_tick_no: 0,
@@ -254,17 +287,18 @@ impl<N: NowSource> Metronome<N> {
     }
     /// Take a temporal sample. This should be called before each batch of
     /// `status` calls.
-    pub fn sample(&mut self) {
+    pub fn sample(&mut self) -> &mut Self {
         self.now = self.now_source.now();
         self.rendered_this_sample = false;
         self.return_idle = true;
+        self
     }
     /// Advance the epoch to the latest tick, to handle rollover or a tickrate
     /// change. We always put this off as long as possible, giving us an absurd
     /// amount of precision on the operation.
     fn advance_epoch(&mut self) {
-        self.epoch += Duration::new(self.last_tick_no, 0)
-            * self.ticks_per_second.1 / self.ticks_per_second.0;
+        self.epoch.advance_by(Duration::new(self.last_tick_no, 0)
+            * self.ticks_per_second.1 / self.ticks_per_second.0);
         self.last_tick_no = 0;
     }
     /// Overflow, either because we've been running a really really long time
@@ -282,14 +316,16 @@ impl<N: NowSource> Metronome<N> {
     /// should take to advance your game world, possibly interspersed with
     /// status information about unusual temporal conditions.
     pub fn status(&mut self, mode: Mode) -> Option<Status> {
-        // first off: if Now is before Epoch, time has REALLY flowed backward
-        if self.now < self.epoch {
-            self.epoch = self.now;
-            self.last_tick_no = 0;
-            return Some(Status::TimeWentBackwards)
-        }
         // calculate the number of ticks between Epoch and Now
-        let time_since_epoch = self.now - self.epoch;
+        let time_since_epoch = match self.now.time_since(&self.epoch) {
+            Some(x) => x,
+            None => {
+                // Time flowed backward!
+                self.epoch = self.now.clone();
+                self.last_tick_no = 0;
+                return Some(Status::TimeWentBackwards);
+            },
+        };
         let duration_since_epoch = match time_since_epoch.checked_mul(self.ticks_per_second.0) {
             Some(x) => x,
             None => {
@@ -297,7 +333,7 @@ impl<N: NowSource> Metronome<N> {
                 return Some(Status::Rollover)
             },
         } / self.ticks_per_second.1;
-        // (if necessary, send this back by one tick...)
+        // (if necessary, send this back by one tick and use a phase of 1.0)
         let (ticks_since_epoch, subsec) = if duration_since_epoch.subsec_nanos() == 0 && mode.cares_about_subticks() {
             (duration_since_epoch.as_secs().saturating_sub(1), 1000000000)
         }
@@ -377,13 +413,8 @@ impl<N: NowSource> Metronome<N> {
                         / self.ticks_per_second.0
                 }
             };
-        let moment_of_next_tick = self.epoch + duration_from_epoch_until_next_tick;
-        if moment_of_next_tick > self.now {
-            Some(moment_of_next_tick - self.now)
-        }
-        else {
-            None
-        }
+        let moment_of_next_tick = self.epoch.advanced_by(duration_from_epoch_until_next_tick);
+        moment_of_next_tick.time_since(&self.now)
     }
     /// Assuming that the current time is fairly close to the most recent
     /// temporal sample, sleep until the moment of the next tick. Good for
@@ -413,6 +444,8 @@ impl<N: NowSource> Metronome<N> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature="no_std")]
+    use std::prelude::*;
     use std::cell::RefCell;
     use super::*;
     #[derive(Debug)]
@@ -425,25 +458,35 @@ mod tests {
         ShouldNotSleep,
     }
     use TestCmd::*;
+    #[derive(Copy,Clone,Default,Debug)]
+    struct TestInstant(Duration);
+    impl TemporalSample for TestInstant {
+        fn time_since(&self, origin: &Self) -> Option<Duration> {
+            self.0.checked_sub(origin.0)
+        }
+        fn advanced_by(&self, amount: Duration) -> Self {
+            TestInstant(self.0 + amount)
+        }
+    }
     #[derive(Debug,Copy,Clone)]
     struct TestNowSource {
-        epoch: Instant,
-        now: Instant,
+        now: TestInstant,
     }
     impl TestNowSource {
         pub fn new() -> TestNowSource {
-            let now = Instant::now();
-            TestNowSource { epoch: now, now }
+            TestNowSource { now: Default::default() }
         }
         pub fn set_now(&mut self, delta: Duration) {
-            self.now = self.epoch.checked_add(delta).unwrap();
+            self.now.0 = delta;
         }
     }
     impl NowSource for TestNowSource {
-        fn now(&mut self) -> Instant { self.now }
+        type Instant = TestInstant;
+        fn now(&mut self) -> TestInstant { self.now }
     }
     impl NowSource for &RefCell<TestNowSource> {
-        fn now(&mut self) -> Instant { self.borrow().now }
+        type Instant = TestInstant;
+        fn now(&mut self) -> TestInstant { self.borrow().now }
     }
     fn run_test(tps: (u32, u32), max_ticks_behind: u32, cmds: &[TestCmd]) {
         let now_source = RefCell::new(TestNowSource::new());
