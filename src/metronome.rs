@@ -1,6 +1,6 @@
 use core::time::Duration;
 
-use super::{NowSource, Rate, TemporalSample};
+use super::{NowSource, PreciseInstant, Rate, TemporalSample};
 
 /// The meat of the crate. Contains all state necessary to turn pure temporal
 /// chaos into an orderly stream of ticks and frames.
@@ -9,10 +9,8 @@ use super::{NowSource, Rate, TemporalSample};
 #[derive(Debug, Clone)]
 pub struct Metronome<N: NowSource> {
     now_source: N,
-    last_tick: Option<N::Instant>,
-    last_frame: Option<N::Instant>,
-    tick_residual: u32,
-    frame_residual: u32,
+    last_tick: Option<PreciseInstant<N::Instant>>,
+    last_frame: Option<PreciseInstant<N::Instant>>,
     tickrate: Rate,
     last_framerate: Option<Rate>,
     max_ticks_behind: u32,
@@ -106,8 +104,6 @@ impl<N: NowSource> Metronome<N> {
             last_frame: None,
             tickrate,
             last_framerate: None,
-            tick_residual: 0,
-            frame_residual: 0,
             max_ticks_behind,
         }
     }
@@ -124,7 +120,6 @@ impl<N: NowSource> Metronome<N> {
         if new_framerate != self.last_framerate {
             self.last_framerate = new_framerate;
             self.last_frame = None;
-            self.frame_residual = 0;
         }
         let now = self.now_source.now();
         MetronomeIterator::new(self, mode, now)
@@ -139,7 +134,9 @@ impl<N: NowSource> Metronome<N> {
         // doesn't also break all the tests
         if self.tickrate != new_rate {
             self.tickrate = new_rate;
-            self.tick_residual = 0;
+            if let Some(last_tick) = self.last_tick.as_mut() {
+                last_tick.forget_residual();
+            }
         }
     }
 }
@@ -148,62 +145,49 @@ pub struct MetronomeIterator<'a, N: NowSource> {
     metronome: &'a mut Metronome<N>,
     now: N::Instant,
     mode: Mode,
-    tick_at: Option<(N::Instant, u32)>,
-    render_at: Option<(N::Instant, u32)>,
+    tick_at: Option<PreciseInstant<N::Instant>>,
+    render_at: Option<PreciseInstant<N::Instant>>,
     idle_for: Option<Duration>,
     time_went_backwards: bool,
     ticks_given: u32,
-}
-
-fn calculate_next_tick<N: NowSource>(tickrate: &Rate, start_point: &N::Instant, in_residual: u32) -> (N::Instant, u32) {
-    let tick_at = start_point.advanced_by(tickrate.duration_per);
-    let new_residual = in_residual + tickrate.residual_per;
-    if new_residual >= tickrate.numerator.get() {
-        let new_residual = new_residual - tickrate.numerator.get();
-        debug_assert!(new_residual < tickrate.numerator.get());
-        (tick_at.advanced_by(Duration::from_nanos(1)), new_residual)
-    } else { (tick_at, new_residual) }
 }
 
 impl<N: NowSource> MetronomeIterator<'_, N> {
     fn new(metronome: &mut Metronome<N>, mode: Mode, now: N::Instant) -> MetronomeIterator<'_, N> {
         let (time_went_backwards, next_tick_at);
         if let Some(last_tick) = metronome.last_tick.as_ref() {
-            if now < *last_tick {
+            if now < last_tick.at {
                 time_went_backwards = true;
-                next_tick_at = (now.clone(), 0);
+                next_tick_at = PreciseInstant::from(now.clone());
             } else {
                 time_went_backwards = false;
-                next_tick_at = calculate_next_tick::<N>(&metronome.tickrate, last_tick, metronome.tick_residual);
+                next_tick_at = last_tick.next(&metronome.tickrate);
             }
         } else {
             time_went_backwards = false;
-            next_tick_at = (now.clone(), 0);
+            next_tick_at = PreciseInstant::from(now.clone());
         }
         if time_went_backwards {
             metronome.last_tick = None;
             metronome.last_frame = None;
-            metronome.tick_residual = 0;
-            metronome.frame_residual = 0;
         }
         let render_at = match mode {
             Mode::TickOnly => None,
-            Mode::OneFramePerTick => Some((now.clone(), 0)),
-            Mode::UnlimitedFrames => Some((now.clone(), 0)),
+            Mode::OneFramePerTick | Mode::UnlimitedFrames => Some(PreciseInstant::from(now.clone())),
         };
-        let render_at = render_at.and_then(|render_at: (N::Instant, u32)| {
+        let render_at = render_at.and_then(|render_at| {
             // Don't render in the future
-            if render_at.0 > now { return None }
+            if render_at.at > now { return None }
             if let Some(last_frame) = metronome.last_frame.as_ref() {
                 // Don't render the same frame twice
-                if *last_frame == render_at.0 { return None }
+                if *last_frame == render_at { return None }
             }
             return Some(render_at)
         });
         let idle_for = match mode {
             Mode::TickOnly | Mode::OneFramePerTick => {
                 // will be None or Some(ZERO) if we don't need to idle
-                next_tick_at.0.time_since(&now)
+                next_tick_at.at.time_since(&now)
             },
             Mode::UnlimitedFrames => None,
         };
@@ -215,7 +199,7 @@ impl<N: NowSource> MetronomeIterator<'_, N> {
             metronome,
             idle_for,
             render_at,
-            tick_at: if next_tick_at.0 > now { None } else { Some(next_tick_at) },
+            tick_at: if next_tick_at.at > now { None } else { Some(next_tick_at) },
             now,
             time_went_backwards,
             mode,
@@ -232,7 +216,7 @@ impl<N: NowSource> Iterator for MetronomeIterator<'_, N> {
             return Some(Reading::TimeWentBackwards)
         }
         let should_render_now = match (self.tick_at.as_ref(), self.render_at.as_ref()) {
-            (Some(next_tick), Some(render_at)) => render_at.0 < next_tick.0,
+            (Some(next_tick), Some(render_at)) => render_at < next_tick,
             (None, Some(_)) => true,
             _ => false,
         };
@@ -242,11 +226,10 @@ impl<N: NowSource> Iterator for MetronomeIterator<'_, N> {
                     // we have taken away `next_tick_at`, so we won't tick anymore
                     return Some(Reading::TicksLost)
                 }
-                (self.metronome.last_tick, self.metronome.tick_residual)
-                    = (Some(next_tick_at.0.clone()), next_tick_at.1);
-                let nexter_tick_at = calculate_next_tick::<N>(&self.metronome.tickrate, &next_tick_at.0, next_tick_at.1);
-                if nexter_tick_at.0 <= self.now {
-                    self.tick_at = Some(nexter_tick_at);
+                self.metronome.last_tick = Some(next_tick_at.clone());
+                let next_tick_at = next_tick_at.next(&self.metronome.tickrate);
+                if next_tick_at.at <= self.now {
+                    self.tick_at = Some(next_tick_at);
                 }
                 return Some(Reading::Tick);
             }
@@ -254,8 +237,7 @@ impl<N: NowSource> Iterator for MetronomeIterator<'_, N> {
         // We got here because we didn't tick. Maybe we didn't tick because we
         // need to render.
         if let Some(render_at) = self.render_at.take() {
-            (self.metronome.last_frame, self.metronome.frame_residual)
-                = (Some(render_at.0.clone()), render_at.1);
+            self.metronome.last_frame = Some(render_at.clone());
             let phase = match self.mode {
                 Mode::TickOnly => unreachable!(),
                 Mode::OneFramePerTick => 1.0,
@@ -263,7 +245,7 @@ impl<N: NowSource> Iterator for MetronomeIterator<'_, N> {
                     match self.metronome.last_tick.as_ref() {
                         None => 1.0, // >:(
                         Some(last_tick) => {
-                            let now_offset = render_at.0.time_since(last_tick)
+                            let now_offset = render_at.at.time_since(&last_tick.at)
                                 .unwrap_or(Duration::ZERO);
                             now_offset.as_nanos() as u64 as f32
                             / self.metronome.tickrate.duration_per.as_nanos() as u64 as f32

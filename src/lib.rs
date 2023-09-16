@@ -131,6 +131,8 @@ extern crate std;
 
 mod rate;
 pub use rate::*;
+mod residual;
+use residual::*;
 mod metronome;
 pub use metronome::*;
 mod time;
