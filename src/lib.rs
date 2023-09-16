@@ -11,7 +11,7 @@
 //! To get started, add `ftvf` to your dependencies in `Cargo.toml`:
 //!
 //! ```toml
-//! ftvf = "0.5"
+//! ftvf = "0.6"
 //! ```
 //! 
 //! then initialize yourself a [`Metronome`](struct.Metronome.html):
@@ -19,9 +19,13 @@
 //! ```rust
 //! # use ftvf::*;
 //! # #[cfg(not(feature="no_std"))] {
-//! let mut metronome = Metronome::new(RealtimeNowSource::new(),
-//!                                    (30, 1), // want 30 ticks per 1 second
-//!                                    5); // accept being up to 5 ticks behind
+//! let mut metronome = Metronome::new(
+//!   RealtimeNowSource::new(),
+//!   // want 30 ticks per 1 second
+//!   Rate::per_second(30, 1),
+//!   // accept being up to 5 ticks behind
+//!   5,
+//! );
 //! # }
 //! ```
 //!
@@ -37,26 +41,21 @@
 //! #   fn render(&mut self, _: f32) {}
 //! #   fn should_quit(&mut self) -> bool { true }
 //! # }
-//! # let mut metronome = Metronome::new(RealtimeNowSource::new(), (30,1), 5);
+//! # let mut metronome = Metronome::new(RealtimeNowSource::new(), Rate::per_second(30, 1), 5);
 //! # let mut world = GameWorld{};
 //! while !world.should_quit() {
 //!   world.handle_input();
-//!   // call `sample` once per batch. not zero times, not two or more times!
-//!   metronome.sample();
-//!   while let Some(status) = metronome.status(Mode::UnlimitedFrames) {
-//!     match status {
-//!       Status::Tick => world.perform_tick(),
-//!       Status::Frame{phase} => world.render(phase),
-//!       Status::TimeWentBackwards
+//!   for reading in metronome.sample(Mode::UnlimitedFrames) {
+//!     match reading {
+//!       Reading::Tick => world.perform_tick(),
+//!       Reading::Frame{phase} => world.render(phase),
+//!       Reading::TimeWentBackwards
 //!         => eprintln!("Warning: time flowed backwards!"),
-//!       Status::TicksLost(n)
-//!         => eprintln!("Warning: we're too slow, lost {} ticks!", n),
-//!       // No special handling or warning message is needed for Rollover. In
-//!       // practice, it will never be seen.
-//!       Status::Rollover => (),
+//!       Reading::TicksLost
+//!         => eprintln!("Warning: we're too slow, lost some ticks!"),
 //!       // Mode::UnlimitedFrames never returns Idle, but other modes can, and
-//!       // this is the way it should be handled.
-//!       Status::Idle => metronome.sleep_until_next_tick(),
+//!       // this is one way to handle it.
+//!       Reading::Idle{duration} => std::thread::sleep(duration),
 //!     }
 //!   }
 //! }
@@ -80,12 +79,30 @@
 //! # }
 //! ```
 //!
+//! # Changes
+//!
+//! ## Since 0.5.0
+//!
+//! - `ftvf` no longer depends on `std`. You can use the `no_std` feature flag
+//!   to make the `std` dependency go away, at the cost of not being able to
+//!   use the built-in `RealtimeNowSource`.
+//! - `Mode::MaxOneFramePerTick` has been renamed to `Mode::OneFramePerTick`.
+//! - `metronome.sample()` now returns an iterator directly, instead of making
+//!   you repeatedly call `metronome.status()` in a disciplined way.
+//! - Rates are now passed using the new `Rate` structure, instead of as
+//!   tuples.
+//! - Timing is now perfectly accurate, instead of "only" having nanosecond
+//!   precision.
+//! - `Status` has been renamed to `Reading`.
+//! - `Reading::Idle` now directly gives you the wait time as a `Duration`,
+//!   instead of making you go indirectly through the `metronome`.
+//!
 //! # License
 //!
 //! `ftvf` is distributed under the zlib license. The complete text is as
 //! follows:
 //!
-//! > Copyright (c) 2019, Solra Bizna
+//! > Copyright (c) 2019, 2023 Solra Bizna
 //! > 
 //! > This software is provided "as-is", without any express or implied
 //! > warranty. In no event will the author be held liable for any damages
@@ -112,7 +129,10 @@
 #[cfg(feature="no_std")] #[macro_use]
 extern crate std;
 
-use core::time::Duration;
+use core::{
+    num::NonZeroU32,
+    time::Duration,
+};
 
 #[cfg(not(feature="no_std"))]
 mod realtime;
@@ -123,7 +143,7 @@ pub use realtime::RealtimeNowSource;
 /// use. For most purposes,
 /// [`RealtimeNowSource`](struct.RealtimeNowSource.html) will be sufficient.
 pub trait NowSource : Copy {
-    type Instant: TemporalSample + Clone;
+    type Instant: TemporalSample + Clone + PartialOrd + PartialEq;
     /// Return a point in time representing Now.
     fn now(&mut self) -> Self::Instant;
     /// Sleep until at least `how_long` from *now*. Optional.
@@ -156,28 +176,77 @@ pub trait TemporalSample : Sized {
     }
 }
 
+/// A frequency, measured by a ratio of seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rate {
+    /// Ticks.
+    numerator: NonZeroU32,
+    /// Seconds.
+    denominator: NonZeroU32,
+    duration_per: Duration,
+    /// The fraction of a nanosecond that accumulates each tick. The numerator
+    /// is `residual_per` and the *denominator* is `numerator`.
+    residual_per: u32,
+}
+
+impl Rate {
+    /// Creates a new Rate with the given numerator and denominator. The
+    /// denominator is seconds.
+    ///
+    /// PANICS if the numerator or denominator are zero, or are greater than
+    /// one billion!
+    pub fn per_second(numerator: u32, denominator: u32) -> Rate {
+        assert_ne!(numerator, 0, "The numerator and denominator cannot be zero.");
+        assert_ne!(denominator, 0, "The numerator and denominator cannot be zero.");
+        assert!(numerator <= 1_000_000_000, "The numerator and denominator may not exceed 1,000,000,000.");
+        assert!(denominator <= 1_000_000_000, "The numerator and denominator may not exceed 1,000,000,000.");
+        Self::per_second_nonzero(NonZeroU32::new(numerator).unwrap(), NonZeroU32::new(denominator).unwrap())
+    }
+    /// Creates a new Rate with the given numerator and denominator. The
+    /// denominator is seconds.
+    ///
+    /// YOU must ensure that the numerator and denominator do not exceed one
+    /// billion.
+    pub const fn per_second_nonzero(numerator: NonZeroU32, denominator: NonZeroU32) -> Rate {
+        let numerator_int = numerator.get();
+        let denominator_int = denominator.get();
+        // numerator/denominator = ticks/second
+        // 1G*denominator/numerator = nanoseconds/tick
+        let denominator_in_nanoseconds = 1_000_000_000u64 * denominator_int as u64;
+        let number_of_nanoseconds
+            = denominator_in_nanoseconds / (numerator_int as u64);
+        let residual
+            = denominator_in_nanoseconds % (numerator_int as u64);
+        debug_assert!(residual < u32::MAX as u64);
+        Rate {
+            numerator: numerator,
+            denominator: denominator,
+            duration_per: Duration::from_nanos(number_of_nanoseconds),
+            residual_per: residual as u32,
+        }
+    }
+}
+
 /// The meat of the crate. Contains all state necessary to turn pure temporal
 /// chaos into an orderly stream of ticks and frames.
 ///
 /// See the crate-level documentation for more information.
-#[derive(Debug,Copy,Clone)]
+#[derive(Debug, Clone)]
 pub struct Metronome<N: NowSource> {
     now_source: N,
-    epoch: N::Instant,
-    now: N::Instant,
-    ticks_per_second: (u32, u32),
+    last_tick: Option<N::Instant>,
+    last_frame: Option<N::Instant>,
+    tick_residual: u32,
+    frame_residual: u32,
+    tickrate: Rate,
+    last_framerate: Option<Rate>,
     max_ticks_behind: u32,
-    last_tick_no: u64,
-    rendered_this_tick: bool,
-    rendered_this_sample: bool,
-    return_idle: bool,
-    paused: bool,
 }
 
 /// Time handling information returned by a
 /// [`Metronome`](struct.Metronome.html).
 #[derive(Clone,Copy,Debug,PartialEq)]
-pub enum Status {
+pub enum Reading {
     /// You should perform a logic tick.
     Tick,
     /// You should render a frame.
@@ -188,60 +257,49 @@ pub enum Status {
     },
     /// No `Tick` or `Frame` occurred this sample. You may want to call
     /// `sleep_until_next_tick`.
-    Idle,
+    Idle {
+        /// Indicates how long you need to sleep before it will be time for
+        /// another tick or frame.
+        duration: Duration,
+    },
     /// The [`NowSource`](trait.NowSource.html) reported a timestamp strictly
     /// earlier than a previous timestamp. This should never happen. A temporal
     /// anomaly is likely. This should be handled by showing some sort of
     /// warning, or ignored.
-    ///
-    /// This may also occur when switching [`Mode`](enum.Mode.html)s on the
-    /// same [`Metronome`](struct.Metronome.html) from `TicksOnly` to another
-    /// mode, which usually would not happen.
     TimeWentBackwards,
     /// Time is passing more quickly than we can process ticks; specifically,
     /// more than the [`Metronome`](struct.Metronome.html)'s `max_ticks_behind`
     /// ticks worth of time has passed since the last time we finished a batch
     /// of ticks. This should be handled by showing some sort of warning, or
     /// ignored.
-    ///
-    /// The value is the number of ticks' worth of time that were just lost.
-    TicksLost(u64),
-    /// An obscenely huge amount of time has passed, and a rarely-used piece of
-    /// logic within `ftvf` handled it correctly. You should **ignore this**
-    /// unless you're testing `ftvf`.
-    ///
-    /// In a typical application, the amount of time necessary to produce this
-    /// variant is on the order of **18,000,000,000 years**. Even in the most
-    /// extreme case (2³²-1 ticks per second), over 136 years must pass for
-    /// `Rollover` to occur. Unless your application is going to operate
-    /// **continuously** for that kind of time frame, you will never encounter
-    /// a `Rollover`; and even if it does, the fact that you did merely
-    /// indicates that `ftvf` is handling the case correctly and nothing needs
-    /// to be done on your end.
-    Rollover,
+    TicksLost,
 }
 
+#[deprecated(since="0.6.0", note="use Reading instead")]
+pub type Status = Reading;
+
 /// How ticks and frames should relate to one another in a given call to
-/// [`Metronome::status`](struct.Metronome.html#method.status).
+/// [`Metronome::sample`](struct.Metronome.html#method.sample).
 #[derive(Clone,Copy,Debug,PartialEq)]
 pub enum Mode {
-    /// No rendering is happening. `Metronome::status` will return `None` when
-    /// all ticks in the current batch are finished. Good for dedicated
-    /// servers, logic test suites, and other headless applications.
+    /// No rendering is happening. Good for dedicated servers, logic test
+    /// suites, minimized games, and other headless applications. Never yields
+    /// `Frame`.
     TickOnly,
-    /// Only render at most one frame per tick.
-    MaxOneFramePerTick,
-    /// May render an unlimited number of frames between ticks. This is the
-    /// preferred value, especially when the intended tickrate is substantially
-    /// lower than the intended framerate. **Never returns `Idle`.**
+    /// Try to render exactly one frame per tick. Frame phase will always be
+    /// `1.0`. Frames may be skipped but will never be doubled.
+    OneFramePerTick,
+    /// Try to render as often as possible. This is the preferred value if you
+    /// don't know the refresh rate. Frame phase will be very jittery. Always
+    /// returns `Frame` exactly once per poll. **Never** returns `Idle`.
     UnlimitedFrames,
     // TODO: TargetFramesPerSecond((u32, u32))?
 }
 
 impl Mode {
-    fn cares_about_subticks(&self) -> bool {
-        *self != Mode::TickOnly
-    }
+    #[allow(non_upper_case_globals)]
+    #[deprecated(since="0.6.0", note="use OneFramePerTick instead")]
+    pub const MaxOneFramePerTick: Mode = Mode::OneFramePerTick;
 }
 
 impl<N: NowSource> Metronome<N> {
@@ -264,181 +322,185 @@ impl<N: NowSource> Metronome<N> {
     /// value on the order of several seconds' worth of ticks might be
     /// preferred.
     pub fn new(
-        mut now_source: N,
-        ticks_per_second: (u32, u32),
+        now_source: N,
+        tickrate: Rate,
         max_ticks_behind: u32,
     ) -> Metronome<N> {
-        assert_ne!(ticks_per_second.0, 0);
-        assert_ne!(ticks_per_second.1, 0);
-        let epoch = now_source.now();
-        let now = epoch.clone();
         Metronome {
             now_source,
-            epoch,
-            now,
-            ticks_per_second,
+            last_tick: None,
+            last_frame: None,
+            tickrate,
+            last_framerate: None,
+            tick_residual: 0,
+            frame_residual: 0,
             max_ticks_behind,
-            last_tick_no: 0,
-            rendered_this_tick: false,
-            rendered_this_sample: false,
-            return_idle: true,
-            paused: false,
         }
     }
-    /// Take a temporal sample. This should be called before each batch of
-    /// `status` calls.
-    pub fn sample(&mut self) -> &mut Self {
-        self.now = self.now_source.now();
-        self.rendered_this_sample = false;
-        self.return_idle = true;
-        self
-    }
-    /// Advance the epoch to the latest tick, to handle rollover or a tickrate
-    /// change. We always put this off as long as possible, giving us an absurd
-    /// amount of precision on the operation.
-    fn advance_epoch(&mut self) {
-        self.epoch.advance_by(Duration::new(self.last_tick_no, 0)
-            * self.ticks_per_second.1 / self.ticks_per_second.0);
-        self.last_tick_no = 0;
-    }
-    /// Overflow, either because we've been running a really really long time
-    /// or because we have a really huge numerator on our tickrate.
-    fn rollover(&mut self) {
-        if self.last_tick_no == 0 {
-            // This should never happen; even if the tickrate was
-            // `(u32::MAX, 1)`, there should still be time for billions
-            // of seconds of ticks before overflow.
-            unreachable!();
-        }
-        self.advance_epoch()
-    }
-    /// Call in a loop after calling `sample`. Returns the actions that you
-    /// should take to advance your game world, possibly interspersed with
-    /// status information about unusual temporal conditions.
-    pub fn status(&mut self, mode: Mode) -> Option<Status> {
-        // calculate the number of ticks between Epoch and Now
-        let time_since_epoch = match self.now.time_since(&self.epoch) {
-            Some(x) => x,
-            None => {
-                // Time flowed backward!
-                self.epoch = self.now.clone();
-                self.last_tick_no = 0;
-                return Some(Status::TimeWentBackwards);
-            },
+    /// Call this from your logic loop, after checking for user input. Returns
+    /// an `Iterator` of `Reading`s, describing how you should respond to any
+    /// time that has passed.
+    pub fn sample<'a>(&'a mut self, mode: Mode) -> impl Iterator<Item=Reading> + 'a {
+        let new_framerate = match mode {
+            Mode::TickOnly => None,
+            Mode::OneFramePerTick => Some(self.tickrate.clone()),
+            Mode::UnlimitedFrames => None,
         };
-        let duration_since_epoch = match time_since_epoch.checked_mul(self.ticks_per_second.0) {
-            Some(x) => x,
-            None => {
-                self.rollover();
-                return Some(Status::Rollover)
-            },
-        } / self.ticks_per_second.1;
-        // (if necessary, send this back by one tick and use a phase of 1.0)
-        let (ticks_since_epoch, subsec) = if duration_since_epoch.subsec_nanos() == 0 && mode.cares_about_subticks() {
-            (duration_since_epoch.as_secs().saturating_sub(1), 1000000000)
+        if new_framerate != self.last_framerate {
+            self.last_framerate = new_framerate;
+            self.frame_residual = 0;
         }
-        else {
-            (duration_since_epoch.as_secs(),
-             duration_since_epoch.subsec_nanos())
+        let now = self.now_source.now();
+        MetronomeIterator::new(self, mode, now)
+    }
+    /// Dynamically change the tickrate. This will cause a small temporal
+    /// anomaly, unless:
+    ///
+    /// - you *only* call this while handling a `Tick`
+    /// - you *always* break the loop and poll again after changing the tickrate
+    pub fn set_tickrate(&mut self, new_rate: Rate) {
+        // TODO: make it only possible to do this from `Tick`, in a way that
+        // doesn't also break all the tests
+        if self.tickrate != new_rate {
+            self.tickrate = new_rate;
+            self.tick_residual = 0;
+        }
+    }
+}
+
+pub struct MetronomeIterator<'a, N: NowSource> {
+    metronome: &'a mut Metronome<N>,
+    now: N::Instant,
+    mode: Mode,
+    tick_at: Option<(N::Instant, u32)>,
+    render_at: Option<(N::Instant, u32)>,
+    idle_for: Option<Duration>,
+    time_went_backwards: bool,
+    ticks_given: u32,
+}
+
+fn calculate_next_tick<N: NowSource>(tickrate: &Rate, start_point: &N::Instant, in_residual: u32) -> (N::Instant, u32) {
+    let tick_at = start_point.advanced_by(tickrate.duration_per);
+    let new_residual = in_residual + tickrate.residual_per;
+    if new_residual >= tickrate.numerator.get() {
+        let new_residual = new_residual - tickrate.numerator.get();
+        debug_assert!(new_residual < tickrate.numerator.get());
+        (tick_at.advanced_by(Duration::from_nanos(1)), new_residual)
+    } else { (tick_at, new_residual) }
+}
+
+impl<N: NowSource> MetronomeIterator<'_, N> {
+    fn new(metronome: &mut Metronome<N>, mode: Mode, now: N::Instant) -> MetronomeIterator<'_, N> {
+        let (time_went_backwards, next_tick_at);
+        if let Some(last_tick) = metronome.last_tick.as_ref() {
+            if now < *last_tick {
+                time_went_backwards = true;
+                next_tick_at = (now.clone(), 0);
+            } else {
+                time_went_backwards = false;
+                next_tick_at = calculate_next_tick::<N>(&metronome.tickrate, last_tick, metronome.tick_residual);
+            }
+        } else {
+            time_went_backwards = false;
+            next_tick_at = (now.clone(), 0);
+        }
+        if time_went_backwards {
+            metronome.last_tick = None;
+            metronome.last_frame = None;
+            metronome.tick_residual = 0;
+            metronome.frame_residual = 0;
+        }
+        let render_at = match mode {
+            Mode::TickOnly => None,
+            Mode::OneFramePerTick => Some((now.clone(), 0)),
+            Mode::UnlimitedFrames => Some((now.clone(), 0)),
         };
-        // if it's lower than the last number, time has flowed backward
-        if ticks_since_epoch < self.last_tick_no {
-            self.last_tick_no = ticks_since_epoch;
-            return Some(Status::TimeWentBackwards)
+        let render_at = render_at.and_then(|render_at: (N::Instant, u32)| {
+            // Don't render in the future
+            if render_at.0 > now { return None }
+            if let Some(last_frame) = metronome.last_frame.as_ref() {
+                // Don't render the same frame twice
+                if *last_frame == render_at.0 { return None }
+            }
+            return Some(render_at)
+        });
+        let idle_for = match mode {
+            Mode::TickOnly | Mode::OneFramePerTick => {
+                // will be None or Some(ZERO) if we don't need to idle
+                next_tick_at.0.time_since(&now)
+            },
+            Mode::UnlimitedFrames => None,
+        };
+        let idle_for = match idle_for {
+            None | Some(Duration::ZERO) => None,
+            x => x,
+        };
+        MetronomeIterator {
+            metronome,
+            idle_for,
+            render_at,
+            tick_at: if next_tick_at.0 > now { None } else { Some(next_tick_at) },
+            now,
+            time_went_backwards,
+            mode,
+            ticks_given: 0,
         }
-        // how many ticks since the last one?
-        let ticks_since_last = ticks_since_epoch - self.last_tick_no;
-        if ticks_since_last > self.max_ticks_behind as u64 {
-            let lost_ticks = ticks_since_last - 1;
-            self.last_tick_no += lost_ticks;
-            return Some(Status::TicksLost(lost_ticks))
+    }
+}
+
+impl<N: NowSource> Iterator for MetronomeIterator<'_, N> {
+    type Item = Reading;
+    fn next(&mut self) -> Option<Reading> {
+        if self.time_went_backwards {
+            self.time_went_backwards = false;
+            return Some(Reading::TimeWentBackwards)
         }
-        else if ticks_since_last > 0 {
-            self.last_tick_no += 1;
-            self.rendered_this_tick = false;
-            self.return_idle = false;
-            if !self.paused {
-                return Some(Status::Tick)
+        let should_render_now = match (self.tick_at.as_ref(), self.render_at.as_ref()) {
+            (Some(next_tick), Some(render_at)) => render_at.0 < next_tick.0,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if !should_render_now {
+            if let Some(next_tick_at) = self.tick_at.take() {
+                if self.ticks_given >= self.metronome.max_ticks_behind {
+                    // we have taken away `next_tick_at`, so we won't tick anymore
+                    return Some(Reading::TicksLost)
+                }
+                (self.metronome.last_tick, self.metronome.tick_residual)
+                    = (Some(next_tick_at.0.clone()), next_tick_at.1);
+                let nexter_tick_at = calculate_next_tick::<N>(&self.metronome.tickrate, &next_tick_at.0, next_tick_at.1);
+                if nexter_tick_at.0 <= self.now {
+                    self.tick_at = Some(nexter_tick_at);
+                }
+                return Some(Reading::Tick);
             }
         }
-        match mode {
-            Mode::TickOnly => {
-                if self.return_idle {
-                    self.return_idle = false;
-                    Some(Status::Idle)
-                }
-                else { None }
-            },
-            Mode::MaxOneFramePerTick => {
-                if self.rendered_this_tick {
-                    if self.return_idle {
-                        self.return_idle = false;
-                        Some(Status::Idle)
+        // We got here because we didn't tick. Maybe we didn't tick because we
+        // need to render.
+        if let Some(render_at) = self.render_at.take() {
+            (self.metronome.last_frame, self.metronome.frame_residual)
+                = (Some(render_at.0.clone()), render_at.1);
+            let phase = match self.mode {
+                Mode::TickOnly => unreachable!(),
+                Mode::OneFramePerTick => 1.0,
+                Mode::UnlimitedFrames => {
+                    match self.metronome.last_tick.as_ref() {
+                        None => 1.0, // >:(
+                        Some(last_tick) => {
+                            let now_offset = render_at.0.time_since(last_tick)
+                                .unwrap_or(Duration::ZERO);
+                            now_offset.as_nanos() as u64 as f32
+                            / self.metronome.tickrate.duration_per.as_nanos() as u64 as f32
+                        },
                     }
-                    else { None }
-                }
-                else {
-                    self.rendered_this_tick = true;
-                    self.return_idle = false;
-                    Some(Status::Frame { phase: 1.0 })
-                }
-            },
-            Mode::UnlimitedFrames => {
-                if self.rendered_this_sample { None }
-                else {
-                    self.rendered_this_sample = true;
-                    self.return_idle = false;
-                    if self.paused {
-                        Some(Status::Frame { phase: 1.0 })
-                    }
-                    else {
-                        Some(Status::Frame { phase: (subsec as f32) / 1.0e9 })
-                    }
-                }
-            }
-        }
-    }
-    /// Return the exact amount that you should sleep, starting at the last
-    /// temporal sample, to arrive at the moment of the next tick. You should
-    /// usually call `sleep_until_next_tick` instead unless you're testing
-    /// `ftvf`. See that method for other information.
-    pub fn amount_to_sleep_until_next_tick(&mut self) -> Option<Duration> {
-        let duration_from_epoch_until_next_tick
-            = match Duration::new(self.last_tick_no+1, 0)
-            .checked_mul(self.ticks_per_second.1) {
-                Some(x) => x / self.ticks_per_second.0,
-                None => {
-                    self.rollover();
-                    Duration::new(1, 0) * self.ticks_per_second.1
-                        / self.ticks_per_second.0
-                }
+                },
             };
-        let moment_of_next_tick = self.epoch.advanced_by(duration_from_epoch_until_next_tick);
-        moment_of_next_tick.time_since(&self.now)
-    }
-    /// Assuming that the current time is fairly close to the most recent
-    /// temporal sample, sleep until the moment of the next tick. Good for
-    /// saving CPU time on mobile devices / dedicated servers. You should only
-    /// call this in response to an `Idle` return from `sample`.
-    pub fn sleep_until_next_tick(&mut self) {
-        match self.amount_to_sleep_until_next_tick() {
-            None => (),
-            Some(x) => self.now_source.sleep(x)
+            return Some(Reading::Frame { phase });
         }
-    }
-    /// Pauses (or unpauses) time. When time is paused, time is being eaten; no
-    /// `Tick`s occur, but `Frame`s may still occur as normal. When resumed,
-    /// `Tick`s will start again, as though no time had passed.
-    pub fn set_paused(&mut self, paused: bool) { self.paused = paused }
-    /// Dynamically change the tickrate. This can be called during the handling
-    /// of a `Tick`, and should not be called at other times, lest temporal
-    /// anomalies occur.
-    pub fn set_tickrate(&mut self, ticks_per_second: (u32, u32)) {
-        if ticks_per_second != self.ticks_per_second {
-            self.advance_epoch();
-            debug_assert_eq!(self.last_tick_no, 0);
-            self.ticks_per_second = ticks_per_second;
+        if let Some(duration) = self.idle_for.take() {
+            return Some(Reading::Idle { duration });
         }
+        None
     }
 }
 
@@ -449,16 +511,13 @@ mod tests {
     use std::cell::RefCell;
     use super::*;
     #[derive(Debug)]
-    enum TestCmd {
+    enum TestCmd<'a> {
         SetNow(u64, u32),
-        StatusWithMode(Option<Status>, Mode),
+        Sample(Mode, &'a[Reading]),
         SetTickrate(u32, u32),
-        SetPaused(bool),
-        AmountToSleep(u64, u32),
-        ShouldNotSleep,
     }
     use TestCmd::*;
-    #[derive(Copy,Clone,Default,Debug)]
+    #[derive(Copy,Clone,Default,Debug,PartialOrd,PartialEq)]
     struct TestInstant(Duration);
     impl TemporalSample for TestInstant {
         fn time_since(&self, origin: &Self) -> Option<Duration> {
@@ -490,51 +549,24 @@ mod tests {
     }
     fn run_test(tps: (u32, u32), max_ticks_behind: u32, cmds: &[TestCmd]) {
         let now_source = RefCell::new(TestNowSource::new());
-        let mut metronome = Metronome::new(&now_source, tps, max_ticks_behind);
+        let mut metronome = Metronome::new(&now_source, Rate::per_second(tps.0, tps.1), max_ticks_behind);
         let mut bad = None;
         for n in 0..cmds.len() {
             let cmd = &cmds[n];
             match cmd {
                 SetNow(sec, nsec) => {
                     now_source.borrow_mut().set_now(Duration::new(*sec,*nsec));
-                    metronome.sample();
                 },
-                StatusWithMode(status, mode) => {
-                    let check = metronome.status(*mode);
-                    if status != &check {
-                        // (allow for different floating point error properties
-                        // of the different way of calculating subframes)
-                        let ok = if let Some(Status::Frame{phase}) = *status {
-                            if let Some(Status::Frame{phase:check_phase}) = check {
-                                (phase - check_phase).abs() < 0.0001
-                            }
-                            else { false }
-                        } else { false };
-                        if !ok {
-                            bad = Some((n, format!("expected {:?}, got {:?}", status, check)));
-                            break;
-                        }
-                    }
-                },
-                AmountToSleep(sec, nsec) => {
-                    let duration = Some(Duration::new(*sec, *nsec));
-                    let check = metronome.amount_to_sleep_until_next_tick();
-                    if duration != check {
-                        bad = Some((n, format!("expected {:?}, got {:?}", duration, check)));
-                        break;
-                    }
-                },
-                ShouldNotSleep => {
-                    let check = metronome.amount_to_sleep_until_next_tick();
-                    if None != check {
-                        bad = Some((n, format!("expected None, got {:?}", check)));
+                Sample(mode, readings) => {
+                    let check: Vec<Reading> = metronome.sample(*mode).collect();
+                    if &check[..] != *readings {
+                        bad = Some((n, format!("got {:?}", check)));
                         break;
                     }
                 },
                 SetTickrate(num, den) => {
-                    metronome.set_tickrate((*num, *den));
+                    metronome.set_tickrate(Rate::per_second(*num, *den));
                 },
-                SetPaused(paused) => { metronome.set_paused(*paused) },
             }
         }
         if let Some((index, explanation)) = bad {
@@ -549,240 +581,119 @@ mod tests {
     }
     #[test]
     fn simple() {
+        const IDLE_FIFTH_SECOND: &[Reading] = &[
+            Reading::Idle { duration: Duration::from_millis(200) },
+        ];
         run_test((5, 1), 10, &[
-            AmountToSleep(0, 200000000),
+            Sample(Mode::OneFramePerTick, &[
+                Reading::Tick,
+                Reading::Frame { phase: 1.0 },
+            ]),
+            Sample(Mode::OneFramePerTick, IDLE_FIFTH_SECOND),
             SetNow(1, 0),
-            ShouldNotSleep,
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::UnlimitedFrames),
-            StatusWithMode(None, Mode::UnlimitedFrames),
+            Sample(Mode::UnlimitedFrames, &[
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Frame { phase: 0.0 },
+            ]),
+            Sample(Mode::UnlimitedFrames, &[
+            ]),
             SetNow(2, 0),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(None, Mode::TickOnly),
+            Sample(Mode::TickOnly, &[
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+            ]),
+            Sample(Mode::TickOnly, IDLE_FIFTH_SECOND),
             SetNow(2, 100000000),
-            StatusWithMode(Some(Status::Frame{phase:0.5}), Mode::UnlimitedFrames),
-            StatusWithMode(None, Mode::UnlimitedFrames),
+            Sample(Mode::UnlimitedFrames, &[
+                Reading::Frame { phase: 0.5 },
+            ]),
+            Sample(Mode::UnlimitedFrames, &[
+            ]),
             SetNow(2, 200000000),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(None, Mode::TickOnly),
-            // Time goes backward because UnlimitedFrames can wind up "one tick
-            // behind" on exact instants where the clock lines up with the
-            // tickrate. This may or may not be a bug. I think it is, but is
-            // not worth fixing, because it would complicate the loop for a
-            // case that will rarely happen and never cause problems (unless
-            // your program handles TimeWentBackwards by raising an error); and
-            // for pity's sakes, we already handled rollover! What more do you
-            // want!?
-            StatusWithMode(Some(Status::TimeWentBackwards), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::UnlimitedFrames),
-            StatusWithMode(None, Mode::UnlimitedFrames),
-            SetNow(2, 400000000),
-            StatusWithMode(Some(Status::Tick), Mode::MaxOneFramePerTick),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::MaxOneFramePerTick),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::UnlimitedFrames),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
-            StatusWithMode(None, Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            SetNow(4, 400000000),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            SetNow(6, 600000000),
-            StatusWithMode(Some(Status::TicksLost(10)), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(None, Mode::TickOnly),
-            SetNow(6, 0),
-            StatusWithMode(Some(Status::TimeWentBackwards), Mode::TickOnly),
-            StatusWithMode(Some(Status::Idle), Mode::TickOnly),
-            StatusWithMode(None, Mode::TickOnly),
-            SetNow(6, 200000000),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::MaxOneFramePerTick),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::UnlimitedFrames),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
-        ]);
-    }
-    #[test]
-    fn rollover() {
-        run_test((0x10000, 1), 10, &[
-            SetNow(0, 0),
-            StatusWithMode(Some(Status::Idle), Mode::TickOnly),
-            StatusWithMode(None, Mode::TickOnly),
-            SetNow(0x100000000, 0),
-            StatusWithMode(Some(Status::TicksLost(0x1000000000000-1)), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(None, Mode::TickOnly),
-            SetNow(0x1000000000000, 0),
-            StatusWithMode(Some(Status::Rollover), Mode::TickOnly),
-            StatusWithMode(Some(Status::TicksLost((0x1000000000000000-0x100000000000)*16-1)), Mode::TickOnly),
-            StatusWithMode(Some(Status::Tick), Mode::TickOnly),
-            StatusWithMode(None, Mode::TickOnly),
-        ]);
-    }
-    #[test] #[should_panic]
-    fn rollover_crash() {
-        run_test((0x10000, 1), 10, &[
-            SetNow(0, 0),
-            StatusWithMode(None, Mode::TickOnly),
-            SetNow(0x1000000000000, 0),
-            StatusWithMode(None, Mode::TickOnly),
+            Sample(Mode::UnlimitedFrames, &[
+                Reading::Tick,
+                Reading::Frame { phase: 0.0 },
+            ]),
+            SetNow(2, 0),
+            Sample(Mode::UnlimitedFrames, &[
+                Reading::TimeWentBackwards,
+                Reading::Tick,
+                Reading::Frame { phase: 0.0 },
+            ]),
         ]);
     }
     #[test]
     fn ntsc() {
         run_test((60000, 1001), 120, &[
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::UnlimitedFrames),
+            Sample(Mode::UnlimitedFrames, &[
+                Reading::Tick,
+                Reading::Frame { phase: 0.0 },
+            ]),
             SetNow(0, 500000000),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Frame{phase:(30.0/1.001)-29.0}), Mode::UnlimitedFrames),
-            AmountToSleep(0, 500000),
-            SetNow(1, 0),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Frame{phase:(60.0/1.001)-59.0}), Mode::UnlimitedFrames),
-            SetNow(1, 250000000),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Frame{phase:(75.0/1.001)-74.0}), Mode::UnlimitedFrames),
-            SetNow(1, 375000000),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Frame{phase:(82.5/1.001)-82.0}), Mode::UnlimitedFrames),
+            Sample(Mode::UnlimitedFrames, &[
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Tick,
+                Reading::Frame { phase: 0.97003 }, // roughly 30.0 / 1.001 - 29.0
+            ]),
         ]);
     }
     #[test]
-    fn vtvf() {
-        run_test((5, 1), 10, &[
-            SetNow(0, 400000000),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::UnlimitedFrames),
-            SetNow(0, 600000000),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::UnlimitedFrames),
-            SetTickrate(10, 1),
-            SetNow(0, 800000000),
-            // should this be two ticks instead of three? ach...
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Tick), Mode::UnlimitedFrames),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::UnlimitedFrames),
-        ]);
-    }
-    #[test]
-    fn pause() {
-        run_test((5, 1), 10, &[
-            SetNow(0, 400000000),
-            StatusWithMode(Some(Status::Tick), Mode::MaxOneFramePerTick),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::MaxOneFramePerTick),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
-            SetNow(0, 600000000),
-            StatusWithMode(Some(Status::Tick), Mode::MaxOneFramePerTick),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::MaxOneFramePerTick),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
-            SetPaused(true),
-            SetNow(0, 800000000),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::MaxOneFramePerTick),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
-            SetNow(1, 0),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::MaxOneFramePerTick),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
-            SetPaused(false),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
-            SetNow(1, 200000000),
-            StatusWithMode(Some(Status::Tick), Mode::MaxOneFramePerTick),
-            StatusWithMode(Some(Status::Frame{phase:1.0}), Mode::MaxOneFramePerTick),
-            StatusWithMode(None, Mode::MaxOneFramePerTick),
+    fn residual_tick() {
+        run_test((3,1), 444, &[
+            Sample(Mode::OneFramePerTick, &[
+                Reading::Tick,
+                Reading::Frame { phase: 1.0 },
+            ]),
+            SetNow(0, 500000000),
+            Sample(Mode::OneFramePerTick, &[
+                Reading::Tick,
+                Reading::Frame { phase: 1.0 },
+            ]),
+            Sample(Mode::OneFramePerTick, &[
+                Reading::Idle { duration: Duration::from_nanos(166666666) },
+            ]),
+            SetNow(0, 750000000),
+            Sample(Mode::OneFramePerTick, &[
+                Reading::Tick,
+                Reading::Frame { phase: 1.0 },
+            ]),
+            Sample(Mode::OneFramePerTick, &[
+                Reading::Idle { duration: Duration::from_nanos(250000000) },
+            ]),
         ]);
     }
 }

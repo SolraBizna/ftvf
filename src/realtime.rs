@@ -15,7 +15,6 @@ impl RealtimeNowSource {
 impl NowSource for RealtimeNowSource {
     type Instant = std::time::Instant;
     fn now(&mut self) -> Self::Instant { Self::Instant::now() }
-    fn sleep(&mut self, how_long: Duration) { std::thread::sleep(how_long) }
 }
 
 impl TemporalSample for Instant {
