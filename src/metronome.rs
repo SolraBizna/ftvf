@@ -77,22 +77,17 @@ impl Mode {
 impl<N: NowSource> Metronome<N> {
     /// Create a new `Metronome`, initialized with the given properties.
     /// - `now_source`: The [`NowSource`](trait.NowSource.html) to use.
-    /// - `ticks_per_second`: The target rate of ticks per second, represented
-    /// as a fraction. For example, `(20, 1)` → 20 ticks per 1 second.
-    /// `(60000, 1001)` → 60000 ticks per 1001 seconds (color NTSC framerate).
-    /// Even very large values are acceptable; the only problem you would have
-    /// from `(u32::MAX, 1)` would be actually processing `Tick`s that quickly,
-    /// and the only problem you would have from `(1, u32::MAX)` would be
-    /// dying of old age waiting for your first `Tick`.
+    /// - `tickrate`: The target rate of ticks per second, represented as a
+    ///   [`Rate`](struct.Rate.html).
     /// - `max_ticks_behind`: The maximum number of ticks we can "fall behind"
-    /// before we start dropping ticks. Increasing this value makes your game's
-    /// tick pacing more steady over time, at the cost of making the play
-    /// experience more miserable on computers too slow to play the game in
-    /// realtime.  
-    /// For a non-multiplayer application this should be fairly low, e.g. in
-    /// the 1-3 range. In multiplayer, we should try harder to keep up, and a
-    /// value on the order of several seconds' worth of ticks might be
-    /// preferred.
+    ///   before we start dropping ticks. Increasing this value makes your
+    ///   game's tick pacing more steady over time, at the cost of making the
+    ///   play experience more miserable on computers too slow to play the game
+    ///   in realtime.  
+    ///   For a non-multiplayer application this should be fairly low, e.g. in
+    ///   the 1-3 range. In multiplayer, we should try harder to keep up, and a
+    ///   value on the order of several seconds' worth of ticks might be
+    ///   preferred.
     pub fn new(
         now_source: N,
         tickrate: Rate,
