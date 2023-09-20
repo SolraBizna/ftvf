@@ -9,7 +9,7 @@ use core::time::Duration;
 /// use. For most purposes,
 /// [`RealtimeNowSource`](struct.RealtimeNowSource.html) will be sufficient.
 pub trait NowSource : Copy {
-    type Instant: TemporalSample + Clone + PartialOrd + PartialEq;
+    type Instant: TemporalSample;
     /// Return a point in time representing Now.
     fn now(&mut self) -> Self::Instant;
     /// Sleep until at least `how_long` from *now*. Optional.
@@ -22,7 +22,7 @@ pub trait NowSource : Copy {
 
 /// A type that represents a particular point in time. You only need to worry
 /// about it if you're implementing your own timing routines.
-pub trait TemporalSample : Sized {
+pub trait TemporalSample : Sized + Clone + PartialOrd + PartialEq + std::fmt::Debug { // TODO: delete Debug
     /// If this TemporalSample is *after* the given origin, return the
     /// `Duration` that has passed since that point. If this TemporalSample is
     /// *before* the given origin, return `None`.
@@ -40,5 +40,8 @@ pub trait TemporalSample : Sized {
     fn advance_by(&mut self, amount: Duration) {
         *self = self.advanced_by(amount);
     }
+    /// Return a new TemporalSample that is this far in the past. Saturates at
+    /// the epoch.
+    fn retreated_by(&self, amount: Duration) -> Self;
 }
 

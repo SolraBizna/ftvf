@@ -2,7 +2,7 @@
 name = "ftvf"
 version = "0.6.0"
 authors = ["Solra Bizna <solra@bizna.name>"]
-edition = "2018"
+edition = "2021"
 license = "Zlib"
 description = "Temporal logic for writing a Fixed Tickrate, Variable Framerate game in Rust."
 repository = "https://github.com/SolraBizna/ftvf"

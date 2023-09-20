@@ -9,7 +9,8 @@ use super::{NowSource, PreciseInstant, Rate, TemporalSample};
 #[derive(Debug, Clone)]
 pub struct Metronome<N: NowSource> {
     now_source: N,
-    last_tick: Option<PreciseInstant<N::Instant>>,
+    past_tick: Option<PreciseInstant<N::Instant>>,
+    future_tick: Option<PreciseInstant<N::Instant>>,
     last_frame: Option<PreciseInstant<N::Instant>>,
     tickrate: Rate,
     last_framerate: Option<Rate>,
@@ -66,12 +67,23 @@ pub enum Mode {
     /// don't know the refresh rate. Frame phase will be very jittery.
     /// **Never** returns `Idle`.
     UnlimitedFrames,
+    /// Try to render at the given target framerate. This is the preferred
+    /// value if you *do* know the refresh rate. Frame phase will be very
+    /// regular, especially if there is a simple relationship between tickrate
+    /// and framerate.
+    TargetFramesPerSecond(Rate),
 }
 
 impl Mode {
     #[allow(non_upper_case_globals)]
     #[deprecated(since="0.6.0", note="use OneFramePerTick instead")]
     pub const MaxOneFramePerTick: Mode = Mode::OneFramePerTick;
+    fn needs_a_future(&self) -> bool {
+        match self {
+            Mode::UnlimitedFrames | Mode::TargetFramesPerSecond(_) => true,
+            _ => false,
+        }
+    }
 }
 
 impl<N: NowSource> Metronome<N> {
@@ -95,7 +107,8 @@ impl<N: NowSource> Metronome<N> {
     ) -> Metronome<N> {
         Metronome {
             now_source,
-            last_tick: None,
+            past_tick: None,
+            future_tick: None,
             last_frame: None,
             tickrate,
             last_framerate: None,
@@ -111,6 +124,7 @@ impl<N: NowSource> Metronome<N> {
             Mode::TickOnly => None,
             Mode::OneFramePerTick => Some(self.tickrate.clone()),
             Mode::UnlimitedFrames => None,
+            Mode::TargetFramesPerSecond(rate) => Some(rate.clone()),
         };
         if new_framerate != self.last_framerate {
             self.last_framerate = new_framerate;
@@ -119,18 +133,15 @@ impl<N: NowSource> Metronome<N> {
         let now = self.now_source.now();
         MetronomeIterator::new(self, mode, now)
     }
-    /// Dynamically change the tickrate. This will cause a small temporal
-    /// anomaly, unless:
-    ///
-    /// - you *only* call this while handling a `Tick`
-    /// - you *always* break the loop and poll again after changing the tickrate
+    /// Dynamically change the tickrate.
     pub fn set_tickrate(&mut self, new_rate: Rate) {
-        // TODO: make it only possible to do this from `Tick`, in a way that
-        // doesn't also break all the tests
         if self.tickrate != new_rate {
             self.tickrate = new_rate;
-            if let Some(last_tick) = self.last_tick.as_mut() {
-                last_tick.forget_residual();
+            if let Some(past_tick) = self.past_tick.as_mut() {
+                past_tick.forget_residual();
+            }
+            if let Some(future_tick) = self.future_tick.as_mut() {
+                future_tick.forget_residual();
             }
         }
     }
@@ -140,8 +151,8 @@ pub struct MetronomeIterator<'a, N: NowSource> {
     metronome: &'a mut Metronome<N>,
     now: N::Instant,
     mode: Mode,
-    tick_at: Option<PreciseInstant<N::Instant>>,
-    render_at: Option<PreciseInstant<N::Instant>>,
+    tick: Option<PreciseInstant<N::Instant>>,
+    frame: Option<PreciseInstant<N::Instant>>,
     idle_for: Option<Duration>,
     time_went_backwards: bool,
     ticks_given: u32,
@@ -149,40 +160,58 @@ pub struct MetronomeIterator<'a, N: NowSource> {
 
 impl<N: NowSource> MetronomeIterator<'_, N> {
     fn new(metronome: &mut Metronome<N>, mode: Mode, now: N::Instant) -> MetronomeIterator<'_, N> {
-        let (time_went_backwards, next_tick_at);
-        if let Some(last_tick) = metronome.last_tick.as_ref() {
-            if now < last_tick.at {
+        let mut time_went_backwards = false;
+        if let Some(past_tick) = metronome.past_tick.as_ref() {
+            if now < past_tick.at {
                 time_went_backwards = true;
-                next_tick_at = PreciseInstant::from(now.clone());
-            } else {
-                time_went_backwards = false;
-                next_tick_at = last_tick.next(&metronome.tickrate);
+                metronome.past_tick = None;
+                metronome.future_tick = None;
+                metronome.last_frame = None;
             }
+        }
+        let tick = if let Some(future_tick) = metronome.future_tick.as_ref() {
+            future_tick.next(&metronome.tickrate)
         } else {
-            time_went_backwards = false;
-            next_tick_at = PreciseInstant::from(now.clone());
-        }
-        if time_went_backwards {
-            metronome.last_tick = None;
-            metronome.last_frame = None;
-        }
-        let render_at = match mode {
-            Mode::TickOnly => None,
-            Mode::OneFramePerTick | Mode::UnlimitedFrames => Some(PreciseInstant::from(now.clone())),
+            PreciseInstant::from(now.clone())
         };
-        let render_at = render_at.and_then(|render_at| {
-            // Don't render in the future
-            if render_at.at > now { return None }
-            if let Some(last_frame) = metronome.last_frame.as_ref() {
+        let frame = match mode {
+            Mode::TickOnly => None,
+            Mode::OneFramePerTick => {
+                Some(tick.last_tick_before(&now, &metronome.tickrate))
+            },
+            Mode::UnlimitedFrames => Some(PreciseInstant::from(now.clone())),
+            Mode::TargetFramesPerSecond(rate) => {
+                debug_assert_eq!(Some(rate), metronome.last_framerate);
+                match metronome.last_frame.as_ref() {
+                    Some(last_frame) => Some(last_frame.last_tick_before(&now, &rate)),
+                    None => Some(tick.last_tick_before(&now, &metronome.tickrate)),
+                }
+            },
+        };
+        let frame = frame.and_then(|frame| {
+            if frame.at > now {
+                // Don't render a frame in the future
+                return None
+            } else if let Some(last_frame) = metronome.last_frame.as_ref() {
                 // Don't render the same frame twice
-                if *last_frame == render_at { return None }
+                if *last_frame == frame { return None }
             }
-            return Some(render_at)
+            Some(frame)
         });
         let idle_for = match mode {
             Mode::TickOnly | Mode::OneFramePerTick => {
                 // will be None or Some(ZERO) if we don't need to idle
-                next_tick_at.at.time_since(&now)
+                tick.at.time_since(&now)
+            },
+            Mode::TargetFramesPerSecond(rate) => {
+                let a = tick.at.time_since(&now);
+                let b = frame.as_ref().map(Clone::clone).unwrap_or_else(|| {
+                    metronome.last_frame.as_ref().unwrap().next(&rate)
+                }).at.time_since(&now);
+                match (a, b) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    _ => None,
+                }
             },
             Mode::UnlimitedFrames => None,
         };
@@ -190,11 +219,17 @@ impl<N: NowSource> MetronomeIterator<'_, N> {
             None | Some(Duration::ZERO) => None,
             x => x,
         };
+        let want_future = if let Some(_frame) = frame.as_ref() {
+            mode.needs_a_future()
+        } else { false };
+        let tick = if want_future || tick.at <= now {
+            Some(tick)
+        } else { None };
         MetronomeIterator {
-            metronome,
             idle_for,
-            render_at,
-            tick_at: if next_tick_at.at > now { None } else { Some(next_tick_at) },
+            frame,
+            tick,
+            metronome,
             now,
             time_went_backwards,
             mode,
@@ -210,44 +245,64 @@ impl<N: NowSource> Iterator for MetronomeIterator<'_, N> {
             self.time_went_backwards = false;
             return Some(Reading::TimeWentBackwards)
         }
-        let should_render_now = match (self.tick_at.as_ref(), self.render_at.as_ref()) {
-            (Some(next_tick), Some(render_at)) => render_at < next_tick,
+        let should_render_now = match (self.tick.as_ref(), self.frame.as_ref()) {
+            (Some(_tick), Some(frame)) => {
+                match (self.metronome.past_tick.as_ref(), self.metronome.future_tick.as_ref()) {
+                    (Some(past), Some(future)) => frame >= past && frame <= future,
+                    _ => false,
+                }
+            },
             (None, Some(_)) => true,
             _ => false,
         };
         if !should_render_now {
-            if let Some(next_tick_at) = self.tick_at.take() {
-                if self.ticks_given >= self.metronome.max_ticks_behind {
-                    // we have taken away `next_tick_at`, so we won't tick anymore
-                    return Some(Reading::TicksLost)
+            if let Some(tick) = self.tick.take() {
+                if tick.at <= self.now || self.frame.is_some() {
+                    if self.ticks_given >= self.metronome.max_ticks_behind {
+                        // Enough ticks have been delivered. Complain.
+                        self.metronome.past_tick = None;
+                        self.metronome.future_tick = None;
+                        self.metronome.last_frame = None;
+                        // self.tick has already been None'd
+                        // self.frame may (or may not) lead to us eventually
+                        // rendering
+                        return Some(Reading::TicksLost)
+                    }
+                    self.metronome.past_tick = self.metronome.future_tick.take();
+                    self.metronome.future_tick = Some(tick.clone());
+                    if self.metronome.past_tick.is_none() {
+                        self.metronome.past_tick = self.metronome.future_tick.clone();
+                    }
+                    let tick = tick.next(&self.metronome.tickrate);
+                    self.tick = Some(tick);
+                    return Some(Reading::Tick);
                 }
-                self.metronome.last_tick = Some(next_tick_at.clone());
-                let next_tick_at = next_tick_at.next(&self.metronome.tickrate);
-                if next_tick_at.at <= self.now {
-                    self.tick_at = Some(next_tick_at);
-                }
-                return Some(Reading::Tick);
             }
         }
         // We got here because we didn't tick. Maybe we didn't tick because we
         // need to render.
-        if let Some(render_at) = self.render_at.take() {
-            self.metronome.last_frame = Some(render_at.clone());
+        if let Some(frame) = self.frame.take() {
             let phase = match self.mode {
                 Mode::TickOnly => unreachable!(),
                 Mode::OneFramePerTick => 1.0,
-                Mode::UnlimitedFrames => {
-                    match self.metronome.last_tick.as_ref() {
-                        None => 1.0, // >:(
-                        Some(last_tick) => {
-                            let now_offset = render_at.at.time_since(&last_tick.at)
-                                .unwrap_or(Duration::ZERO);
-                            now_offset.as_nanos() as u64 as f32
-                            / self.metronome.tickrate.duration_per.as_nanos() as u64 as f32
+                Mode::UnlimitedFrames | Mode::TargetFramesPerSecond(_) => {
+                    match (self.metronome.past_tick.as_ref(), self.metronome.future_tick.as_ref()) {
+                        (Some(past_tick), Some(future_tick)) if past_tick != future_tick => {
+                            if frame.at < past_tick.at { 0.0 }
+                            else if frame.at > future_tick.at { 1.0 }
+                            else {
+                                let tick_step = future_tick.at.time_since(&past_tick.at).unwrap();
+                                let frame_offset = frame.at.time_since(&past_tick.at).unwrap();
+                                frame_offset.as_nanos() as f32 / tick_step.as_nanos() as f32
+                            }
                         },
+                        _ => 1.0,
                     }
                 },
             };
+            self.metronome.last_frame = Some(frame);
+            // if we render, do not tick again
+            self.tick = None;
             return Some(Reading::Frame { phase });
         }
         if let Some(duration) = self.idle_for.take() {

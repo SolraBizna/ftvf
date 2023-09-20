@@ -27,6 +27,9 @@ impl TemporalSample for Instant {
     fn advance_by(&mut self, amount: Duration) {
         *self += amount;
     }
+    fn retreated_by(&self, amount: Duration) -> Self {
+        *self - amount
+    }
 }
 
 #[cfg(test)]

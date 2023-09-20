@@ -4,6 +4,7 @@ use std::prelude::*;
 
 use std::{
     cell::RefCell,
+    num::NonZeroU32,
     time::Duration,
 };
 
@@ -24,6 +25,9 @@ impl TemporalSample for TestInstant {
     }
     fn advanced_by(&self, amount: Duration) -> Self {
         TestInstant(self.0 + amount)
+    }
+    fn retreated_by(&self, amount: Duration) -> Self {
+        TestInstant(self.0.saturating_sub(amount))
     }
 }
 #[derive(Debug,Copy,Clone)]
@@ -96,7 +100,7 @@ fn simple() {
             Reading::Tick,
             Reading::Tick,
             Reading::Tick,
-            Reading::Frame { phase: 0.0 },
+            Reading::Frame { phase: 1.0 },
         ]),
         Sample(Mode::UnlimitedFrames, &[
         ]),
@@ -111,20 +115,20 @@ fn simple() {
         Sample(Mode::TickOnly, IDLE_FIFTH_SECOND),
         SetNow(2, 100000000),
         Sample(Mode::UnlimitedFrames, &[
+            Reading::Tick,
             Reading::Frame { phase: 0.5 },
         ]),
         Sample(Mode::UnlimitedFrames, &[
         ]),
         SetNow(2, 200000000),
         Sample(Mode::UnlimitedFrames, &[
-            Reading::Tick,
-            Reading::Frame { phase: 0.0 },
+            Reading::Frame { phase: 1.0 },
         ]),
-        SetNow(2, 0),
+        SetNow(1, 0),
         Sample(Mode::UnlimitedFrames, &[
             Reading::TimeWentBackwards,
             Reading::Tick,
-            Reading::Frame { phase: 0.0 },
+            Reading::Frame { phase: 1.0 },
         ]),
     ]);
 }
@@ -133,7 +137,7 @@ fn ntsc() {
     run_test((60000, 1001), 120, &[
         Sample(Mode::UnlimitedFrames, &[
             Reading::Tick,
-            Reading::Frame { phase: 0.0 },
+            Reading::Frame { phase: 1.0 },
         ]),
         SetNow(0, 500000000),
         Sample(Mode::UnlimitedFrames, &[
@@ -166,7 +170,32 @@ fn ntsc() {
             Reading::Tick,
             Reading::Tick,
             Reading::Tick,
-            Reading::Frame { phase: 0.97003 }, // roughly 30.0 / 1.001 - 29.0
+            Reading::Tick,
+            Reading::Frame { phase: 0.97002995 }, // roughly 30.0 / 1.001 - 29.0
+        ]),
+    ]);
+}
+#[test]
+fn marathon() {
+    const SIXTY_FPS: Rate = unsafe { Rate::per_second_nonzero(NonZeroU32::new_unchecked(60), NonZeroU32::new_unchecked(1)) };
+    run_test((30, 1), 94332, &[
+        Sample(Mode::TargetFramesPerSecond(SIXTY_FPS), &[
+            Reading::Tick,
+            Reading::Frame { phase: 1.0 },
+        ]),
+        SetNow(0, 1000000000 * 2 / 60),
+        Sample(Mode::TargetFramesPerSecond(SIXTY_FPS), &[
+            Reading::Tick,
+            Reading::Frame { phase: 1.0 },
+        ]),
+        SetNow(0, 1000000000 * 3 / 60),
+        Sample(Mode::TargetFramesPerSecond(SIXTY_FPS), &[
+            Reading::Tick,
+            Reading::Frame { phase: 0.50000006 },
+        ]),
+        SetNow(0, 1000000000 * 4 / 60),
+        Sample(Mode::TargetFramesPerSecond(SIXTY_FPS), &[
+            Reading::Frame { phase: 1.0 },
         ]),
     ]);
 }
