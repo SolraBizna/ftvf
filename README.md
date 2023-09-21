@@ -87,6 +87,10 @@ self.render_at(self.previous_position
   from up to one nanosecond of one-time temporal error per change.
 - `NowSource::sleep` removed.
 - `NowSource` no longer implies `Copy`.
+- There is now a blanket `NowSource` implementation for all
+  `Deref<Target=RefCell<NowSource>>` types, including `&RefCell<NowSource>`
+  and `Box<RefCell<NowSource>>`. This makes fake `NowSources` a little more
+  ergonomic.
 
 ## License
 

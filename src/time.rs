@@ -3,7 +3,11 @@ mod realtime;
 #[cfg(not(feature="no_std"))]
 pub use realtime::RealtimeNowSource;
 
-use core::time::Duration;
+use core::{
+    ops::Deref,
+    cell::RefCell,
+    time::Duration,
+};
 
 #[cfg_attr(not(feature="no_std"), doc="\
 A source of time information for [`Metronome`](struct.Metronome.html) to use. \
@@ -21,6 +25,13 @@ pub trait NowSource {
     type Instant: TemporalSample;
     /// Return a point in time representing Now.
     fn now(&mut self) -> Self::Instant;
+}
+
+impl<T: Deref<Target=RefCell<N>>, N: NowSource> NowSource for T {
+    type Instant = N::Instant;
+    fn now(&mut self) -> N::Instant {
+        self.borrow_mut().now()
+    }
 }
 
 /// A type that represents a particular point in time. You only need to worry

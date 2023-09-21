@@ -43,10 +43,6 @@ impl NowSource for TestNowSource {
     type Instant = TestInstant;
     fn now(&mut self) -> TestInstant { self.now }
 }
-impl NowSource for &RefCell<TestNowSource> {
-    type Instant = TestInstant;
-    fn now(&mut self) -> TestInstant { self.borrow().now }
-}
 fn run_test(tps: (u32, u32), max_ticks_behind: u32, cmds: &[TestCmd]) {
     let now_source = RefCell::new(TestNowSource::new());
     let mut metronome = Metronome::new(&now_source, Rate::per_second(tps.0, tps.1), max_ticks_behind);
