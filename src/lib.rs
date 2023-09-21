@@ -104,6 +104,8 @@
 //! - `Mode::TargetFramesPerSecond` added.
 //! - Tickrate can now be changed at any time, with no temporal anomaly—apart
 //!   from up to one nanosecond of one-time temporal error per change.
+//! - `NowSource::sleep` removed.
+//! - `NowSource` no longer implies `Copy`.
 //!
 //! # License
 //!
@@ -138,12 +140,15 @@
 extern crate std;
 
 mod rate;
+#[doc(inline)]
 pub use rate::*;
 mod residual;
 use residual::*;
 mod metronome;
+#[doc(inline)]
 pub use metronome::*;
 mod time;
+#[doc(inline)]
 pub use time::*;
 
 #[cfg(test)]

@@ -55,6 +55,7 @@ pub enum Reading {
 }
 
 #[deprecated(since="0.6.0", note="use Reading instead")]
+#[doc(hidden)]
 pub type Status = Reading;
 
 /// How ticks and frames should relate to one another in a given call to
@@ -82,6 +83,7 @@ pub enum Mode {
 impl Mode {
     #[allow(non_upper_case_globals)]
     #[deprecated(since="0.6.0", note="use OneFramePerTick instead")]
+    #[doc(hidden)]
     pub const MaxOneFramePerTick: Mode = Mode::OneFramePerTick;
     fn needs_a_future(&self) -> bool {
         match self {
