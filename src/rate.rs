@@ -3,7 +3,7 @@ use core::{
     time::Duration,
 };
 
-/// A frequency, measured by a ratio of seconds.
+/// A frequency, measured by some rational fraction of seconds.
 #[derive(Debug, Clone, Copy)]
 pub struct Rate {
     /// Ticks.
@@ -62,6 +62,7 @@ impl Rate {
     }
 }
 
+/// Compute the greatest common divisor of two numbers using Lamé's method.
 const fn gcd(a: u32, b: u32) -> u32 {
     let (mut big, mut small) = if a > b { (a,b) } else { (b,a) };
     while big != small {

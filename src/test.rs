@@ -26,9 +26,6 @@ impl TemporalSample for TestInstant {
     fn advanced_by(&self, amount: Duration) -> Self {
         TestInstant(self.0 + amount)
     }
-    fn retreated_by(&self, amount: Duration) -> Self {
-        TestInstant(self.0.saturating_sub(amount))
-    }
 }
 #[derive(Debug,Copy,Clone)]
 struct TestNowSource {

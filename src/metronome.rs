@@ -29,8 +29,10 @@ pub enum Reading {
         /// 1 (current tick), inclusive.
         phase: f32
     },
-    /// No `Tick` or `Frame` occurred this sample. You may want to call
-    /// `sleep_until_next_tick`.
+    /// No `Tick` or `Frame` occurred this sample. If you call
+    /// `std::thread::sleep(duration)` (or equivalent) and then sample again,
+    /// you will have waited exactly long enough for the next `Tick` or `Frame`
+    /// to appear.
     Idle {
         /// Indicates how long you need to sleep before it will be time for
         /// another tick or frame.
@@ -38,8 +40,11 @@ pub enum Reading {
     },
     /// The [`NowSource`](trait.NowSource.html) reported a timestamp strictly
     /// earlier than a previous timestamp. This should never happen. A temporal
-    /// anomaly is likely. This should be handled by showing some sort of
+    /// anomaly has happened. This should be handled by showing some sort of
     /// warning, or ignored.
+    ///
+    /// `ftvf` currently fails to detect temporal anomalies that result in one
+    /// tick or less of "slip".
     TimeWentBackwards,
     /// Time is passing more quickly than we can process ticks; specifically,
     /// more than the [`Metronome`](struct.Metronome.html)'s `max_ticks_behind`
@@ -116,9 +121,9 @@ impl<N: NowSource> Metronome<N> {
         }
     }
     /// Call this from your logic loop, after checking for user input. Returns
-    /// an `Iterator` of `Reading`s, describing how you should respond to any
-    /// time that has passed. See [`Reading`](enum.Reading.html) for info on
-    /// what each reading means.
+    /// an `Iterator` of `Reading`s, describing how you should respond to the
+    /// passage of time. See [`Reading`](enum.Reading.html) for info on what
+    /// each reading means.
     pub fn sample<'a>(&'a mut self, mode: Mode) -> impl Iterator<Item=Reading> + 'a {
         let new_framerate = match mode {
             Mode::TickOnly => None,
@@ -133,7 +138,11 @@ impl<N: NowSource> Metronome<N> {
         let now = self.now_source.now();
         MetronomeIterator::new(self, mode, now)
     }
-    /// Dynamically change the tickrate.
+    /// Dynamically change the tickrate. You can call this at any time and it
+    /// will take effect after the current tick. If you call this from within
+    /// a loop over an iterator returned by `sample`, you should `break` out of
+    /// the loop, because it does not currently detect the new tick rate
+    /// mid-loop.
     pub fn set_tickrate(&mut self, new_rate: Rate) {
         if self.tickrate != new_rate {
             self.tickrate = new_rate;
@@ -146,6 +155,9 @@ impl<N: NowSource> Metronome<N> {
         }
     }
 }
+
+/// Returned by [`Metronome::sample`](struct.Metronome.html#method.sample). See
+/// that method's documentation.
 
 pub struct MetronomeIterator<'a, N: NowSource> {
     metronome: &'a mut Metronome<N>,

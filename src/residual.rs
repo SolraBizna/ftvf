@@ -6,6 +6,9 @@ use core::{
 
 use super::{Rate, TemporalSample};
 
+/// This is an internal type that aids in tracking the residual
+/// (sub-nanosecond) element of a timestamp. The caller must keep track of the
+/// denominator of the residual and call `forget_residual` any time it changes.
 #[derive(Debug, Clone)]
 pub(crate) struct PreciseInstant<Instant: TemporalSample> {
     pub(crate) at: Instant,

@@ -40,8 +40,5 @@ pub trait TemporalSample : Sized + Clone + PartialOrd + PartialEq + std::fmt::De
     fn advance_by(&mut self, amount: Duration) {
         *self = self.advanced_by(amount);
     }
-    /// Return a new TemporalSample that is this far in the past. Saturates at
-    /// the epoch.
-    fn retreated_by(&self, amount: Duration) -> Self;
 }
 

@@ -10,6 +10,9 @@ many advantages:
 jump height depends on how fast your computer is.
 - **Satisfaction**: knowing that you made the morally correct choice. :)
 
+Bonus: If you know your refresh rate, `ftvf` can help you render frames at
+exactly that rate, jitter-free.
+
 To get started, add `ftvf` to your dependencies in `Cargo.toml`:
 
 ```toml
@@ -73,10 +76,15 @@ self.render_at(self.previous_position
 - Rates are now passed using the new `Rate` structure, instead of as
   tuples.
 - Timing is now perfectly accurate, instead of "only" having nanosecond
-  precision.
+  precision. (Nanosecond precision is still used for frame phase
+  calculation, and changing tick-/framerates at runtime also discards
+  sub-nanosecond components.)
 - `Status` has been renamed to `Reading`.
 - `Reading::Idle` now directly gives you the wait time as a `Duration`,
   instead of making you go indirectly through the `metronome`.
+- `Mode::TargetFramesPerSecond` added.
+- Tickrate can now be changed at any time, with no temporal anomaly—apart
+  from up to one nanosecond of one-time temporal error per change.
 
 ## License
 
