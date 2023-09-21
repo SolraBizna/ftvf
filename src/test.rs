@@ -201,3 +201,24 @@ fn residual_tick() {
         ]),
     ]);
 }
+#[test]
+fn max_payne() {
+    run_test((1,1), 2345, &[
+        Sample(Mode::OneFramePerTick, &[
+            Reading::Tick,
+            Reading::Frame { phase: 1.0 },
+        ]),
+        SetNow(1, 0),
+        Sample(Mode::OneFramePerTick, &[
+            Reading::Tick,
+            Reading::Frame { phase: 1.0 },
+        ]),
+        SetTickrate(2, 1),
+        SetNow(2, 0),
+        Sample(Mode::OneFramePerTick, &[
+            Reading::Tick,
+            Reading::Tick,
+            Reading::Frame { phase: 1.0 },
+        ]),
+    ]);
+}
