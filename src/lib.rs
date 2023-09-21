@@ -110,6 +110,9 @@
 //!   `Deref<Target=RefCell<NowSource>>` types, including `&RefCell<NowSource>`
 //!   and `Box<RefCell<NowSource>>`. This makes fake `NowSources` a little more
 //!   ergonomic.
+//! - There is now a `FakeNowSource`, available with or without `no_std`, which
+//!   you can use in any situation where real time is not a factor, such as
+//!   unit tests or rendering replays to disk.
 //!
 //! # License
 //!

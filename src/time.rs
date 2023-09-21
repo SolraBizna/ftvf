@@ -2,6 +2,8 @@
 mod realtime;
 #[cfg(not(feature="no_std"))]
 pub use realtime::RealtimeNowSource;
+mod fake;
+pub use fake::*;
 
 use core::{
     ops::Deref,

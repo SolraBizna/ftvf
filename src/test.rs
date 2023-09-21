@@ -27,31 +27,15 @@ impl TemporalSample for TestInstant {
         TestInstant(self.0 + amount)
     }
 }
-#[derive(Debug,Copy,Clone)]
-struct TestNowSource {
-    now: TestInstant,
-}
-impl TestNowSource {
-    pub fn new() -> TestNowSource {
-        TestNowSource { now: Default::default() }
-    }
-    pub fn set_now(&mut self, delta: Duration) {
-        self.now.0 = delta;
-    }
-}
-impl NowSource for TestNowSource {
-    type Instant = TestInstant;
-    fn now(&mut self) -> TestInstant { self.now }
-}
 fn run_test(tps: (u32, u32), max_ticks_behind: u32, cmds: &[TestCmd]) {
-    let now_source = RefCell::new(TestNowSource::new());
+    let now_source = RefCell::new(FakeNowSource::default());
     let mut metronome = Metronome::new(&now_source, Rate::per_second(tps.0, tps.1), max_ticks_behind);
     let mut bad = None;
     for n in 0..cmds.len() {
         let cmd = &cmds[n];
         match cmd {
             SetNow(sec, nsec) => {
-                now_source.borrow_mut().set_now(Duration::new(*sec,*nsec));
+                now_source.borrow_mut().now = Duration::new(*sec,*nsec);
             },
             Sample(mode, readings) => {
                 let check: Vec<Reading> = metronome.sample(*mode).collect();
